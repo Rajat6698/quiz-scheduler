@@ -16,6 +16,15 @@ Required environment variables (set as GitHub Actions secrets):
   GOOGLE_SERVICE_ACCOUNT_JSON   Full JSON key of the service account (as a string)
   GOOGLE_SHEET_ID           The long id in the sheet's URL between /d/ and /edit
 
+Optional:
+  TELEGRAM_ADMIN_CHAT_ID    Your personal Telegram chat id. If set, the bot
+                             sends you a private message summarising any
+                             errors from a run. If not set, alerts are simply
+                             skipped (the script still works fine without it).
+                             You must have messaged the bot at least once
+                             yourself for it to be allowed to message you back
+                             -- see README for how to find this id.
+
 Sheet columns (exact header names expected in row 1):
   Date | Time | Question | Option A | Option B | Option C | Option D |
   Correct Option | Explanation | Posted
@@ -106,6 +115,30 @@ def build_options(row):
     return options
 
 
+def send_admin_alert(message):
+    """Sends a private text message to the admin chat, if TELEGRAM_ADMIN_CHAT_ID
+    is configured. Silently does nothing if it isn't set -- this alert is a
+    nice-to-have, not something that should ever break a run on its own."""
+    admin_chat_id = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
+    if not admin_chat_id:
+        return
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        resp = requests.post(
+            url,
+            data={"chat_id": admin_chat_id, "text": message},
+            timeout=30,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"WARNING: could not send admin alert -- {data.get('description')}")
+    except requests.RequestException as e:
+        print(f"WARNING: could not send admin alert -- {e}")
+
+
 def send_quiz_poll(row):
     token = get_env_or_die("TELEGRAM_BOT_TOKEN")
     channel = get_env_or_die("TELEGRAM_CHANNEL_ID")
@@ -148,6 +181,7 @@ def main():
     posted_count = 0
     skipped_count = 0
     error_count = 0
+    error_details = []  # human-readable lines, collected for the admin alert
 
     for i, row in enumerate(rows):
         row_num = i + 2  # +2 because row 1 is the header and gspread rows are 1-indexed
@@ -164,6 +198,7 @@ def main():
         except ValueError as e:
             print(f"Row {row_num}: could not parse Date/Time ({e}) -- skipping")
             error_count += 1
+            error_details.append(f"Row {row_num}: bad Date/Time format ({e})")
             continue
 
         if scheduled > now_ist:
@@ -176,6 +211,7 @@ def main():
             for p in problems:
                 print(f"    - {p}")
             error_count += 1
+            error_details.append(f"Row {row_num}: {'; '.join(problems)}")
             continue
 
         ok, error = send_quiz_poll(row)
@@ -186,12 +222,21 @@ def main():
         else:
             print(f"Row {row_num}: FAILED to post -- {error}")
             error_count += 1
+            error_details.append(f"Row {row_num}: Telegram rejected it -- {error}")
 
     print(
         f"\nSummary: {posted_count} posted, {skipped_count} not yet due, "
         f"{error_count} errors/skipped this run."
     )
     if error_count:
+        alert_lines = [
+            f"\u26a0\ufe0f Quiz Scheduler run had {error_count} problem(s):",
+            "",
+        ]
+        alert_lines.extend(error_details)
+        alert_lines.append("")
+        alert_lines.append(f"({posted_count} posted successfully this run, no action needed for those.)")
+        send_admin_alert("\n".join(alert_lines))
         sys.exit(1)  # makes the GitHub Actions run show as failed, so you notice
 
 
