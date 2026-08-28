@@ -1,14 +1,23 @@
 """
-Telegram Quiz Scheduler
-------------------------
-Reads a Google Sheet of quiz questions, finds any whose scheduled
-date/time has arrived and hasn't been posted yet, sends them to a
-Telegram channel as native quiz polls, and marks them posted.
+Telegram Quiz & Post Scheduler
+--------------------------------
+Reads a Google Spreadsheet with two tabs:
+
+  Tab 1 "Quizzes" (the original sheet1 tab -- name doesn't matter, it's
+  just whichever tab is first): quiz questions, posted as native
+  Telegram quiz polls.
+
+  Tab 2 "Posts" (must be named exactly "Posts"): plain text
+  announcements or photo-with-caption posts -- for job notifications,
+  exam updates, results, or anything that isn't a quiz.
+
+Both tabs are optional in the sense that if "Posts" doesn't exist yet,
+it's simply skipped with a note printed to the log -- this script
+works fine with just the original Quizzes tab, same as before.
 
 Designed to be run repeatedly (e.g. every 5 minutes via GitHub Actions
-cron). It is safe to run more often than needed -- rows already marked
-"Yes" in the Posted column are skipped, so there is no duplicate-post
-risk even if two runs overlap slightly.
+cron). Rows already marked "Yes" in their Posted column are always
+skipped, so re-running never causes duplicate posts.
 
 Required environment variables (set as GitHub Actions secrets):
   TELEGRAM_BOT_TOKEN        Bot token from @BotFather
@@ -19,15 +28,21 @@ Required environment variables (set as GitHub Actions secrets):
 Optional:
   TELEGRAM_ADMIN_CHAT_ID    Your personal Telegram chat id. If set, the bot
                              sends you a private message summarising any
-                             errors from a run. If not set, alerts are simply
-                             skipped (the script still works fine without it).
-                             You must have messaged the bot at least once
-                             yourself for it to be allowed to message you back
-                             -- see README for how to find this id.
+                             errors from a run.
 
-Sheet columns (exact header names expected in row 1):
+"Quizzes" tab columns (exact header names expected in row 1):
   Date | Time | Question | Option A | Option B | Option C | Option D |
   Correct Option | Explanation | Posted
+
+"Posts" tab columns (exact header names expected in row 1):
+  Date | Time | Type | Message | Image URL | Posted
+
+  Type must be exactly "Text" or "Photo".
+    - Text posts: only "Message" is used (plain announcement).
+    - Photo posts: "Image URL" is required (a direct, publicly
+      accessible link to the image -- see README for how to get one
+      from Google Drive or a free image host), and "Message" becomes
+      the photo's caption.
 """
 
 import os
@@ -49,6 +64,8 @@ SCOPES = [
 TELEGRAM_QUESTION_MAX = 300
 TELEGRAM_OPTION_MAX = 100
 TELEGRAM_EXPLANATION_MAX = 200
+TELEGRAM_TEXT_MESSAGE_MAX = 4096
+TELEGRAM_PHOTO_CAPTION_MAX = 1024
 
 REQUIRED_ENV = [
     "TELEGRAM_BOT_TOKEN",
@@ -66,14 +83,13 @@ def get_env_or_die(name):
     return val
 
 
-def connect_sheet():
+def connect_spreadsheet():
     creds_json = get_env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
     sheet_id = get_env_or_die("GOOGLE_SHEET_ID")
     info = json.loads(creds_json)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     client = gspread.authorize(creds)
-    sheet = client.open_by_key(sheet_id).sheet1
-    return sheet
+    return client.open_by_key(sheet_id)
 
 
 def parse_scheduled_datetime(date_str, time_str):
@@ -83,8 +99,32 @@ def parse_scheduled_datetime(date_str, time_str):
     return dt.replace(tzinfo=IST)
 
 
-def validate_row(row, row_num):
-    """Returns a list of problems with this row (empty list = valid)."""
+def send_admin_alert(message):
+    """Sends a private text message to the admin chat, if TELEGRAM_ADMIN_CHAT_ID
+    is configured. Silently does nothing if it isn't set."""
+    admin_chat_id = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
+    if not admin_chat_id:
+        return
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        resp = requests.post(
+            url, data={"chat_id": admin_chat_id, "text": message}, timeout=30,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"WARNING: could not send admin alert -- {data.get('description')}")
+    except requests.RequestException as e:
+        print(f"WARNING: could not send admin alert -- {e}")
+
+
+# ---------------------------------------------------------------------------
+# Quiz tab
+# ---------------------------------------------------------------------------
+
+def validate_quiz_row(row):
     problems = []
     if len(row["Question"]) > TELEGRAM_QUESTION_MAX:
         problems.append(
@@ -97,8 +137,7 @@ def validate_row(row, row_num):
             )
     if row.get("Explanation") and len(row["Explanation"]) > TELEGRAM_EXPLANATION_MAX:
         problems.append(
-            f"Explanation is {len(row['Explanation'])} chars, exceeds Telegram's {TELEGRAM_EXPLANATION_MAX}-char limit "
-            f"(it will be sent truncated by Telegram itself)"
+            f"Explanation is {len(row['Explanation'])} chars, exceeds Telegram's {TELEGRAM_EXPLANATION_MAX}-char limit"
         )
     correct = row.get("Correct Option", "").strip().upper()
     if correct not in ("A", "B", "C", "D"):
@@ -107,36 +146,7 @@ def validate_row(row, row_num):
 
 
 def build_options(row):
-    options = []
-    for col in ["Option A", "Option B", "Option C", "Option D"]:
-        val = row.get(col, "").strip()
-        if val:
-            options.append(val)
-    return options
-
-
-def send_admin_alert(message):
-    """Sends a private text message to the admin chat, if TELEGRAM_ADMIN_CHAT_ID
-    is configured. Silently does nothing if it isn't set -- this alert is a
-    nice-to-have, not something that should ever break a run on its own."""
-    admin_chat_id = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
-    if not admin_chat_id:
-        return
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        resp = requests.post(
-            url,
-            data={"chat_id": admin_chat_id, "text": message},
-            timeout=30,
-        )
-        data = resp.json()
-        if not data.get("ok"):
-            print(f"WARNING: could not send admin alert -- {data.get('description')}")
-    except requests.RequestException as e:
-        print(f"WARNING: could not send admin alert -- {e}")
+    return [row[col].strip() for col in ["Option A", "Option B", "Option C", "Option D"] if row.get(col, "").strip()]
 
 
 def send_quiz_poll(row):
@@ -146,7 +156,6 @@ def send_quiz_poll(row):
     options = build_options(row)
     correct_letter = row["Correct Option"].strip().upper()
     correct_index = ["A", "B", "C", "D"].index(correct_letter)
-    # correct_index must be valid for however many options actually exist
     if correct_index >= len(options):
         return False, f"Correct Option '{correct_letter}' has no matching option text"
 
@@ -156,88 +165,206 @@ def send_quiz_poll(row):
         "options": json.dumps(options),
         "type": "quiz",
         "correct_option_id": correct_index,
-        "is_anonymous": True,  # Telegram requires anonymous polls in channels
+        "is_anonymous": True,
     }
     explanation = row.get("Explanation", "").strip()
     if explanation:
         payload["explanation"] = explanation[:TELEGRAM_EXPLANATION_MAX]
 
-    url = f"https://api.telegram.org/bot{token}/sendPoll"
-    resp = requests.post(url, data=payload, timeout=30)
+    resp = requests.post(f"https://api.telegram.org/bot{token}/sendPoll", data=payload, timeout=30)
     data = resp.json()
     if not data.get("ok"):
         return False, data.get("description", "Unknown Telegram API error")
     return True, None
 
 
-def main():
-    for name in REQUIRED_ENV:
-        get_env_or_die(name)
+def process_quiz_tab(spreadsheet, now_ist):
+    posted, skipped, errors, details = 0, 0, 0, []
+    try:
+        ws = spreadsheet.sheet1
+    except gspread.exceptions.WorksheetNotFound:
+        print("No quiz tab found -- skipping quiz processing.")
+        return posted, skipped, errors, details
 
-    sheet = connect_sheet()
-    rows = sheet.get_all_records()  # list of dicts keyed by header row
-    now_ist = datetime.now(IST)
-
-    posted_count = 0
-    skipped_count = 0
-    error_count = 0
-    error_details = []  # human-readable lines, collected for the admin alert
-
+    rows = ws.get_all_records()
     for i, row in enumerate(rows):
-        row_num = i + 2  # +2 because row 1 is the header and gspread rows are 1-indexed
-        posted_flag = str(row.get("Posted", "")).strip().lower()
-
-        if posted_flag == "yes":
-            continue  # already posted, nothing to do
-
+        row_num = i + 2
+        if str(row.get("Posted", "")).strip().lower() == "yes":
+            continue
         if not row.get("Date") or not row.get("Time"):
-            continue  # blank row, ignore silently
+            continue
 
         try:
             scheduled = parse_scheduled_datetime(str(row["Date"]), str(row["Time"]))
         except ValueError as e:
-            print(f"Row {row_num}: could not parse Date/Time ({e}) -- skipping")
-            error_count += 1
-            error_details.append(f"Row {row_num}: bad Date/Time format ({e})")
+            print(f"[Quizzes] Row {row_num}: could not parse Date/Time ({e}) -- skipping")
+            errors += 1
+            details.append(f"[Quizzes] Row {row_num}: bad Date/Time format ({e})")
             continue
 
         if scheduled > now_ist:
-            skipped_count += 1
-            continue  # not due yet
+            skipped += 1
+            continue
 
-        problems = validate_row(row, row_num)
+        problems = validate_quiz_row(row)
         if problems:
-            print(f"Row {row_num}: NOT posted, validation failed:")
-            for p in problems:
-                print(f"    - {p}")
-            error_count += 1
-            error_details.append(f"Row {row_num}: {'; '.join(problems)}")
+            print(f"[Quizzes] Row {row_num}: NOT posted, validation failed: {'; '.join(problems)}")
+            errors += 1
+            details.append(f"[Quizzes] Row {row_num}: {'; '.join(problems)}")
             continue
 
         ok, error = send_quiz_poll(row)
         if ok:
-            sheet.update_cell(row_num, list(row.keys()).index("Posted") + 1, "Yes")
-            print(f"Row {row_num}: posted successfully.")
-            posted_count += 1
+            ws.update_cell(row_num, list(row.keys()).index("Posted") + 1, "Yes")
+            print(f"[Quizzes] Row {row_num}: posted successfully.")
+            posted += 1
         else:
-            print(f"Row {row_num}: FAILED to post -- {error}")
-            error_count += 1
-            error_details.append(f"Row {row_num}: Telegram rejected it -- {error}")
+            print(f"[Quizzes] Row {row_num}: FAILED to post -- {error}")
+            errors += 1
+            details.append(f"[Quizzes] Row {row_num}: Telegram rejected it -- {error}")
+
+    return posted, skipped, errors, details
+
+
+# ---------------------------------------------------------------------------
+# Posts tab (text announcements / photo posts)
+# ---------------------------------------------------------------------------
+
+def validate_post_row(row):
+    problems = []
+    post_type = row.get("Type", "").strip().lower()
+    if post_type not in ("text", "photo"):
+        problems.append(f"Type must be 'Text' or 'Photo' (got: '{row.get('Type')}')")
+        return problems
+
+    message = row.get("Message", "").strip()
+    if post_type == "text":
+        if not message:
+            problems.append("Text posts need a Message")
+        elif len(message) > TELEGRAM_TEXT_MESSAGE_MAX:
+            problems.append(
+                f"Message is {len(message)} chars, exceeds Telegram's {TELEGRAM_TEXT_MESSAGE_MAX}-char limit"
+            )
+    else:  # photo
+        if not row.get("Image URL", "").strip():
+            problems.append("Photo posts need an Image URL")
+        if len(message) > TELEGRAM_PHOTO_CAPTION_MAX:
+            problems.append(
+                f"Message (caption) is {len(message)} chars, exceeds Telegram's {TELEGRAM_PHOTO_CAPTION_MAX}-char "
+                f"limit for photo captions"
+            )
+    return problems
+
+
+def send_text_post(row):
+    token = get_env_or_die("TELEGRAM_BOT_TOKEN")
+    channel = get_env_or_die("TELEGRAM_CHANNEL_ID")
+    payload = {
+        "chat_id": channel,
+        "text": row["Message"].strip(),
+        "disable_web_page_preview": False,
+    }
+    resp = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data=payload, timeout=30)
+    data = resp.json()
+    if not data.get("ok"):
+        return False, data.get("description", "Unknown Telegram API error")
+    return True, None
+
+
+def send_photo_post(row):
+    token = get_env_or_die("TELEGRAM_BOT_TOKEN")
+    channel = get_env_or_die("TELEGRAM_CHANNEL_ID")
+    payload = {
+        "chat_id": channel,
+        "photo": row["Image URL"].strip(),
+    }
+    caption = row.get("Message", "").strip()
+    if caption:
+        payload["caption"] = caption[:TELEGRAM_PHOTO_CAPTION_MAX]
+    resp = requests.post(f"https://api.telegram.org/bot{token}/sendPhoto", data=payload, timeout=30)
+    data = resp.json()
+    if not data.get("ok"):
+        return False, data.get("description", "Unknown Telegram API error")
+    return True, None
+
+
+def process_posts_tab(spreadsheet, now_ist):
+    posted, skipped, errors, details = 0, 0, 0, []
+    try:
+        ws = spreadsheet.worksheet("Posts")
+    except gspread.exceptions.WorksheetNotFound:
+        print("No 'Posts' tab found -- skipping (this is fine if you only use quizzes).")
+        return posted, skipped, errors, details
+
+    rows = ws.get_all_records()
+    for i, row in enumerate(rows):
+        row_num = i + 2
+        if str(row.get("Posted", "")).strip().lower() == "yes":
+            continue
+        if not row.get("Date") or not row.get("Time"):
+            continue
+
+        try:
+            scheduled = parse_scheduled_datetime(str(row["Date"]), str(row["Time"]))
+        except ValueError as e:
+            print(f"[Posts] Row {row_num}: could not parse Date/Time ({e}) -- skipping")
+            errors += 1
+            details.append(f"[Posts] Row {row_num}: bad Date/Time format ({e})")
+            continue
+
+        if scheduled > now_ist:
+            skipped += 1
+            continue
+
+        problems = validate_post_row(row)
+        if problems:
+            print(f"[Posts] Row {row_num}: NOT posted, validation failed: {'; '.join(problems)}")
+            errors += 1
+            details.append(f"[Posts] Row {row_num}: {'; '.join(problems)}")
+            continue
+
+        post_type = row["Type"].strip().lower()
+        ok, error = send_text_post(row) if post_type == "text" else send_photo_post(row)
+        if ok:
+            ws.update_cell(row_num, list(row.keys()).index("Posted") + 1, "Yes")
+            print(f"[Posts] Row {row_num}: posted successfully ({post_type}).")
+            posted += 1
+        else:
+            print(f"[Posts] Row {row_num}: FAILED to post -- {error}")
+            errors += 1
+            details.append(f"[Posts] Row {row_num}: Telegram rejected it -- {error}")
+
+    return posted, skipped, errors, details
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    for name in REQUIRED_ENV:
+        get_env_or_die(name)
+
+    spreadsheet = connect_spreadsheet()
+    now_ist = datetime.now(IST)
+
+    q_posted, q_skipped, q_errors, q_details = process_quiz_tab(spreadsheet, now_ist)
+    p_posted, p_skipped, p_errors, p_details = process_posts_tab(spreadsheet, now_ist)
+
+    posted_count = q_posted + p_posted
+    skipped_count = q_skipped + p_skipped
+    error_count = q_errors + p_errors
+    error_details = q_details + p_details
 
     print(
         f"\nSummary: {posted_count} posted, {skipped_count} not yet due, "
         f"{error_count} errors/skipped this run."
     )
     if error_count:
-        alert_lines = [
-            f"\u26a0\ufe0f Quiz Scheduler run had {error_count} problem(s):",
-            "",
-        ]
+        alert_lines = [f"\u26a0\ufe0f Scheduler run had {error_count} problem(s):", ""]
         alert_lines.extend(error_details)
         alert_lines.append("")
         alert_lines.append(f"({posted_count} posted successfully this run, no action needed for those.)")
         send_admin_alert("\n".join(alert_lines))
-        sys.exit(1)  # makes the GitHub Actions run show as failed, so you notice
+        sys.exit(1)
 
 
 if __name__ == "__main__":
