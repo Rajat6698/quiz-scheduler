@@ -35,14 +35,24 @@ Optional:
   Correct Option | Explanation | Posted
 
 "Posts" tab columns (exact header names expected in row 1):
-  Date | Time | Type | Message | Image URL | Posted
+  Date | Time | Type | Message | File URL | Posted
 
-  Type must be exactly "Text" or "Photo".
+  (If you're upgrading from an earlier version of this sheet, just
+  rename your existing "Image URL" column header to "File URL" --
+  it's the same column, just also used for PDFs now, not only images.)
+
+  Type must be exactly "Text", "Photo", or "Document".
     - Text posts: only "Message" is used (plain announcement).
-    - Photo posts: "Image URL" is required (a direct, publicly
+    - Photo posts: "File URL" is required (a direct, publicly
       accessible link to the image -- see README for how to get one
       from Google Drive or a free image host), and "Message" becomes
       the photo's caption.
+    - Document posts: "File URL" is required and MUST end in .pdf or
+      .zip -- this is a hard limit from Telegram itself, not something
+      this script can work around. Sending other file types (like a
+      .docx) by URL isn't supported by Telegram's API; convert to PDF
+      first. "Message" becomes the document's caption. Files over
+      ~50MB may be rejected by Telegram -- compress large PDFs first.
 """
 
 import os
@@ -260,14 +270,23 @@ def process_quiz_tab(spreadsheet, now_ist):
 # Posts tab (text announcements / photo posts)
 # ---------------------------------------------------------------------------
 
+def get_file_url(row):
+    """Reads the file URL from either 'File URL' (current column name) or
+    'Image URL' (old column name), so upgrading doesn't break existing
+    sheets that haven't renamed the header yet."""
+    return (row.get("File URL") or row.get("Image URL") or "").strip()
+
+
 def validate_post_row(row):
     problems = []
     post_type = row.get("Type", "").strip().lower()
-    if post_type not in ("text", "photo"):
-        problems.append(f"Type must be 'Text' or 'Photo' (got: '{row.get('Type')}')")
+    if post_type not in ("text", "photo", "document"):
+        problems.append(f"Type must be 'Text', 'Photo', or 'Document' (got: '{row.get('Type')}')")
         return problems
 
     message = row.get("Message", "").strip()
+    file_url = get_file_url(row)
+
     if post_type == "text":
         if not message:
             problems.append("Text posts need a Message")
@@ -275,13 +294,27 @@ def validate_post_row(row):
             problems.append(
                 f"Message is {len(message)} chars, exceeds Telegram's {TELEGRAM_TEXT_MESSAGE_MAX}-char limit"
             )
-    else:  # photo
-        if not row.get("Image URL", "").strip():
-            problems.append("Photo posts need an Image URL")
+    elif post_type == "photo":
+        if not file_url:
+            problems.append("Photo posts need a File URL")
         if len(message) > TELEGRAM_PHOTO_CAPTION_MAX:
             problems.append(
                 f"Message (caption) is {len(message)} chars, exceeds Telegram's {TELEGRAM_PHOTO_CAPTION_MAX}-char "
                 f"limit for photo captions"
+            )
+    else:  # document
+        if not file_url:
+            problems.append("Document posts need a File URL")
+        elif not (file_url.lower().endswith(".pdf") or file_url.lower().endswith(".zip")):
+            problems.append(
+                "Document File URL must end in .pdf or .zip -- Telegram only supports sending "
+                "documents by URL for these two file types (this is a Telegram limit, not a "
+                "script limit). Other file types would need to be converted to PDF first."
+            )
+        if len(message) > TELEGRAM_PHOTO_CAPTION_MAX:
+            problems.append(
+                f"Message (caption) is {len(message)} chars, exceeds Telegram's {TELEGRAM_PHOTO_CAPTION_MAX}-char "
+                f"limit for document captions"
             )
     return problems
 
@@ -306,12 +339,29 @@ def send_photo_post(row):
     channel = get_env_or_die("TELEGRAM_CHANNEL_ID")
     payload = {
         "chat_id": channel,
-        "photo": row["Image URL"].strip(),
+        "photo": get_file_url(row),
     }
     caption = row.get("Message", "").strip()
     if caption:
         payload["caption"] = caption[:TELEGRAM_PHOTO_CAPTION_MAX]
     resp = requests.post(f"https://api.telegram.org/bot{token}/sendPhoto", data=payload, timeout=30)
+    data = resp.json()
+    if not data.get("ok"):
+        return False, data.get("description", "Unknown Telegram API error")
+    return True, None
+
+
+def send_document_post(row):
+    token = get_env_or_die("TELEGRAM_BOT_TOKEN")
+    channel = get_env_or_die("TELEGRAM_CHANNEL_ID")
+    payload = {
+        "chat_id": channel,
+        "document": get_file_url(row),
+    }
+    caption = row.get("Message", "").strip()
+    if caption:
+        payload["caption"] = caption[:TELEGRAM_PHOTO_CAPTION_MAX]
+    resp = requests.post(f"https://api.telegram.org/bot{token}/sendDocument", data=payload, timeout=30)
     data = resp.json()
     if not data.get("ok"):
         return False, data.get("description", "Unknown Telegram API error")
@@ -354,7 +404,12 @@ def process_posts_tab(spreadsheet, now_ist):
             continue
 
         post_type = row["Type"].strip().lower()
-        ok, error = send_text_post(row) if post_type == "text" else send_photo_post(row)
+        if post_type == "text":
+            ok, error = send_text_post(row)
+        elif post_type == "photo":
+            ok, error = send_photo_post(row)
+        else:
+            ok, error = send_document_post(row)
         if ok:
             ws.update_cell(row_num, list(row.keys()).index("Posted") + 1, "Yes")
             print(f"[Posts] Row {row_num}: posted successfully ({post_type}).")
