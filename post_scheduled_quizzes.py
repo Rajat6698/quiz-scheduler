@@ -92,11 +92,41 @@ def connect_spreadsheet():
     return client.open_by_key(sheet_id)
 
 
+DATE_FORMATS = ["%d/%m/%Y", "%Y-%m-%d", "%m/%d/%Y"]
+TIME_FORMATS = ["%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M:%S %p"]
+
+
 def parse_scheduled_datetime(date_str, time_str):
-    """Sheet stores Date as DD/MM/YYYY and Time as HH:MM (24-hour), both in IST."""
-    combined = f"{date_str.strip()} {time_str.strip()}"
-    dt = datetime.strptime(combined, "%d/%m/%Y %H:%M")
-    return dt.replace(tzinfo=IST)
+    """Parses the Date/Time columns. Tries DD/MM/YYYY first (our intended
+    format) but falls back to a couple of other date layouts, and accepts
+    both 24-hour and 12-hour (AM/PM, with or without seconds) time formats --
+    Google Sheets silently rewrites what you typed into one of these even
+    when you didn't ask it to, so the script tolerates all of them rather
+    than requiring you to fight the sheet's auto-formatting."""
+    date_str = date_str.strip()
+    time_str = time_str.strip()
+
+    parsed_date = None
+    for fmt in DATE_FORMATS:
+        try:
+            parsed_date = datetime.strptime(date_str, fmt).date()
+            break
+        except ValueError:
+            continue
+    if parsed_date is None:
+        raise ValueError(f"could not recognise date '{date_str}' in any supported format")
+
+    parsed_time = None
+    for fmt in TIME_FORMATS:
+        try:
+            parsed_time = datetime.strptime(time_str, fmt).time()
+            break
+        except ValueError:
+            continue
+    if parsed_time is None:
+        raise ValueError(f"could not recognise time '{time_str}' in any supported format")
+
+    return datetime.combine(parsed_date, parsed_time, tzinfo=IST)
 
 
 def send_admin_alert(message):
