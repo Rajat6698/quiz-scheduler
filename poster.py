@@ -99,7 +99,7 @@ def default_chips(d):
             ("computer", "Online", "Application"),
             ("location", *(d.get("location") or "Himachal Pradesh").split(" ", 1)) if " " in (d.get("location") or "Himachal Pradesh")
             else ("location", d.get("location"), "Location"),
-            ("bank", org or "Govt.", "Recruitment"),
+            ("bank", org if org and len(org) <= 14 else "Govt.", "Recruitment"),
         ]
     if cat == "admit_card":
         return [("download", "Download", "Admit Card"), ("badge", "Carry", "Photo ID"),
@@ -114,7 +114,7 @@ def default_chips(d):
         return [("book", "Complete", "Syllabus"), ("assignment", "Exam", "Pattern"),
                 ("check", "Topic-wise", "Plan"), ("school", "Start", "Preparing")]
     return [("bell", "Latest", "Update"), ("doc", "Official", "Notice"),
-            ("check", "Read", "Carefully"), ("public", org or "Official", "Website")]
+            ("check", "Read", "Carefully"), ("public", org if org and len(org) <= 14 else "Official", "Website")]
 
 
 def pick_background(d):
@@ -339,24 +339,65 @@ def draw_note(ps, text):
     ps.rotated_layer((216, 206), draw, -7, (852, 30))
 
 
+def wrap_words(ps, text, f, max_w):
+    lines, line = [], ""
+    for word in text.split():
+        trial = (line + " " + word).strip()
+        if not line or ps.width(trial, f) <= max_w:
+            line = trial
+        else:
+            lines.append(line)
+            line = word
+    return lines + ([line] if line else [])
+
+
+def wrap_fit(ps, text, kind, max_size, min_size, max_w, max_lines):
+    """Biggest font size at which the text fits in max_lines lines of max_w width."""
+    for size in range(int(max_size), int(min_size) - 1, -2):
+        f = font(kind, size, text)
+        lines = wrap_words(ps, text, f, max_w)
+        if len(lines) <= max_lines and all(ps.width(l, f) <= max_w for l in lines):
+            return lines, f, size
+    size = int(min_size)
+    f = font(kind, size, text)
+    lines = wrap_words(ps, text, f, max_w)[:max_lines]
+    while lines and ps.width(lines[-1] + "…", f) > max_w and " " in lines[-1]:
+        lines[-1] = lines[-1].rsplit(" ", 1)[0]
+    if lines and len(wrap_words(ps, text, f, max_w)) > max_lines:
+        lines[-1] += "…"
+    return lines, f, size
+
+
 def draw_headline(ps, d, top, bottom):
     org, exam = d.get("org", "").strip(), d.get("exam", "").strip()
-    lines = [l for l in (org, exam) if l]
-    if not lines:
-        lines = ["NEW UPDATE"]
+    if not org and not exam:
+        org = "NEW UPDATE"
     ps.rrect((28, top, 700, bottom), 28, NAVY, outline=WHITE, width=5, gradient=(NAVY_LIGHT, NAVY_DARK))
-    max_w = 620
-    if len(lines) == 1:
-        f1, s1 = ps.fit(lines[0], "black", 118, max_w, 42)
-        ps.text((364, (top + bottom) / 2 - (18 if bottom - top > 200 else 0)), lines[0], f1, WHITE, anchor="mm")
-        return
-    f1, s1 = ps.fit(lines[0], "black", 120, max_w, 46)
-    f2, s2 = ps.fit(lines[1], "black", 88, max_w, 36)
-    gap = 8
-    block = s1 * 0.95 + gap + s2 * 0.95
-    y1 = top + (bottom - top - block) / 2 + s1 * 0.47 - (14 if d.get("vacancies") else 0)
-    ps.text((364, y1), lines[0], f1, WHITE, anchor="mm")
-    ps.text((364, y1 + s1 * 0.48 + gap + s2 * 0.5), lines[1], f2, YELLOW, anchor="mm")
+    max_w = 616
+    pad_bottom = 44 if d.get("vacancies") else 26
+    avail = bottom - top - 26 - pad_bottom
+    gap = 10
+    scale = 1.0
+    while True:
+        blocks = []
+        if org:
+            one = wrap_fit(ps, org, "black", 118 * scale, 40, max_w, 1)
+            if exam and (one[2] < 60 * scale or one[0][-1].endswith("…")):
+                one = wrap_fit(ps, org, "black", 100 * scale, 40, max_w, 2)
+            blocks.append((one if exam else wrap_fit(ps, org, "black", 118 * scale, 40, max_w, 2), WHITE))
+        if exam:
+            blocks.append((wrap_fit(ps, exam, "black", 86 * scale, 32, max_w, 2 if org else 3), YELLOW))
+        heights = [len(lines) * size * 1.12 for (lines, f, size), c in blocks]
+        total = sum(heights) + gap * (len(blocks) - 1)
+        if total <= avail or scale < 0.45:
+            break
+        scale -= 0.07
+    y = top + 26 + (avail - total) / 2
+    for ((lines, f, size), colour), h in zip(blocks, heights):
+        line_h = size * 1.12
+        for i, line in enumerate(lines):
+            ps.text((364, y + line_h * i + line_h / 2), line, f, colour, anchor="mm")
+        y += h + gap
 
 
 def draw_vacancies(ps, d, y):

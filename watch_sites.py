@@ -300,8 +300,21 @@ def short_headline(title):
 
 
 def poster_fields(title, site, org_full, label):
-    return {"category": LABEL_TO_CATEGORY.get(label, "general"), "org": short_org(site),
-            "exam": short_headline(title), "org_full": org_full}
+    org, exam = short_org(site), short_headline(title)
+    if not org:
+        # Titles like "HP High Court Recruitment 2026: Librarian" -> "HP High Court" + "Librarian Recruitment 2026"
+        m = re.match(r"^(.{2,48}?)\s+((?:recruitment|bharti|result|admit\s*card|answer\s*key|exam\s*date|syllabus|"
+                     r"notification|vacancy)\b.*)$", title.strip(), re.I)
+        if m:
+            org, rest = m.group(1).strip(" -–:"), m.group(2).strip()
+            if ":" in rest:
+                before, after = rest.split(":", 1)
+                after = after.strip()
+                useful = after and len(after) <= 28 and not re.match(
+                    r"(check|download|apply|click|out|released|declared|here|link|notice|pdf|full)", after, re.I)
+                rest = f"{after} {before.strip()}" if useful else before.strip()
+            exam = short_headline(rest) if len(rest) > 44 else rest
+    return {"category": LABEL_TO_CATEGORY.get(label, "general"), "org": org, "exam": exam, "org_full": org_full}
 
 
 def fmt_date(v):
