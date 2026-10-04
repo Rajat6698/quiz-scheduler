@@ -37,6 +37,7 @@ Uses the same GitHub secrets as the quiz scheduler:
 import os
 import re
 import sys
+import html
 import json
 from datetime import datetime
 from pathlib import Path
@@ -73,6 +74,9 @@ DEFAULT_SITES = [
     # Himexam is another coaching site: you get told about its new posts, but the
     # channel post never links to it. Find the official link before posting.
     ["Himexam", "", "https://himexam.com/", "himexam.com/", "No", "Yes"],
+    # Public Telegram channels: use the https://t.me/s/<name> address. Only job/exam posts are sent.
+    ["just5000 (Telegram)", "", "https://t.me/s/just5000", "", "No", "Yes"],
+    ["allexam31 (Telegram)", "", "https://t.me/s/allexam31", "", "No", "Yes"],
 ]
 SITE_HEADERS = ["Name", "Organisation", "URL", "Must contain", "Share link", "Active", "Last checked", "Result", "Failures"]
 LOG_HEADERS = ["Found at", "Site", "Title", "Link", "Status", "Details"]
@@ -202,8 +206,53 @@ def fetch(url):
     return r.text, r.url
 
 
+JOB_WORDS = re.compile(
+    r"recruitment|vacanc|notification|bharti|भर्ती|result|परिणाम|admit\s*card|प्रवेश\s*पत्र|answer\s*key|"
+    r"उत्तर\s*कुंजी|exam\s*date|syllabus|पाठ्यक्रम|apply\s*online|last\s*date|merit\s*list|"
+    r"interview|cut\s*off|call\s*letter|advertisement|विज्ञापन",
+    re.I,
+)
+EDGE_JUNK = re.compile(r"^[^\w\u0900-\u097F(]+|[^\w\u0900-\u097F).!?]+$")
+
+
+def telegram_title(text):
+    """Picks the most useful line of a Telegram post to use as its title."""
+    lines = [EDGE_JUNK.sub("", l).strip() for l in text.splitlines()]
+    lines = [re.sub(r"\s+", " ", l) for l in lines if len(l) >= 12]
+    for line in lines:
+        if JOB_WORDS.search(line):
+            return line[:150]
+    return lines[0][:150] if lines else ""
+
+
+def extract_telegram_posts(html_text, must_contain=""):
+    """Reads the public web view of a Telegram channel (https://t.me/s/<name>)."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    out = []
+    for msg in soup.select("div.tgme_widget_message[data-post]"):
+        body = msg.select_one(".tgme_widget_message_text")
+        if not body:
+            continue
+        for br in body.find_all("br"):
+            br.replace_with("\n")
+        text = body.get_text()
+        if must_contain:
+            if must_contain.lower() not in text.lower():
+                continue
+        elif not JOB_WORDS.search(text):
+            continue            # skip quizzes, ads, motivation etc.
+        title = telegram_title(text)
+        if len(title) < 12:
+            continue
+        url = "https://t.me/" + msg["data-post"]
+        out.append((url, title, url))
+    return out
+
+
 def extract_links(html, base_url, must_contain=""):
     """Returns [(key, title, url)] for every link that looks like a notice."""
+    if re.match(r"https?://t\.me/", base_url):
+        return extract_telegram_posts(html, must_contain)
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
         tag.decompose()
@@ -299,8 +348,8 @@ def short_headline(title):
     return (t[:1].upper() + t[1:]) if t else title[:44]
 
 
-def poster_fields(title, site, org_full, label):
-    org, exam = short_org(site), short_headline(title)
+def poster_fields(title, site, org_full, label, official=True):
+    org, exam = (short_org(site) if official else ""), short_headline(title)
     if not org:
         # Titles like "HP High Court Recruitment 2026: Librarian" -> "HP High Court" + "Librarian Recruitment 2026"
         m = re.match(r"^(.{2,48}?)\s+((?:recruitment|bharti|result|admit\s*card|answer\s*key|exam\s*date|syllabus|"
@@ -322,26 +371,52 @@ def fmt_date(v):
     return dt.strftime("%d %b %Y") if dt else str(v)
 
 
+# Order and labels of the job details shown in the caption.
+CAPTION_DETAILS = [
+    ("org_full", "🏛️ Organisation"), ("posts", "💼 Post"), ("vacancies", "👥 Vacancies"),
+    ("qualification", "🎓 Qualification"), ("age", "🎂 Age limit"), ("salary", "💵 Salary"),
+    ("fee", "💰 Application fee"), ("selection", "📝 Selection"), ("start_date", "🟢 Apply from"),
+    ("last_date", "📅 Last date"), ("exam_date", "🗓️ Exam date"), ("apply_link", "🔗 Apply online"),
+    ("website", "🌐 Official website"), ("extra", "ℹ️"),
+]
+DATE_FIELDS = ("start_date", "last_date", "exam_date")
+
+
 def make_caption(info):
     """info = the Details saved for this notice (poster fields + title, url, share)."""
     f = info["fields"]
     cat = f.get("category", "general")
-    head = [f"{CATEGORY_EMOJI.get(cat, '📌')} {CATEGORY_TO_LABEL.get(cat, 'NOTIFICATION')}", ""]
+    head = f"{CATEGORY_EMOJI.get(cat, '📌')} {CATEGORY_TO_LABEL.get(cat, 'NOTIFICATION')}"
     facts = []
-    if f.get("org_full"):
-        facts.append(f"🏛️ {f['org_full']}")
-    if f.get("vacancies"):
-        facts.append(f"👥 Vacancies: {f['vacancies']}")
-    if f.get("posts"):
-        facts.append(f"💼 Posts: {f['posts']}")
-    if f.get("last_date"):
-        facts.append(f"📅 Last date: {fmt_date(f['last_date'])}")
-    if info.get("share") and info.get("url"):
-        facts.append(f"🔗 {info['url']}")
-    tail = "\n".join(facts + ["", SIGNATURE])
-    room = 1024 - len("\n".join(head)) - len(tail) - 4
-    body = info["title"] if len(info["title"]) <= room else info["title"][: room - 1] + "…"
-    return "\n".join(head + [body, ""]) + "\n" + tail
+    for key, label in CAPTION_DETAILS:
+        val = str(f.get(key, "")).strip()
+        if not val:
+            continue
+        if key in DATE_FIELDS:
+            val = fmt_date(val)
+        facts.append(f"{label} {val}" if key == "extra" else f"{label}: {val}")
+    if info.get("share") and info.get("url") and not f.get("apply_link"):
+        facts.append(f"🔗 Notice: {info['url']}")
+    tail = "\n".join(facts + ["", SIGNATURE]) if facts else SIGNATURE
+    if len(tail) > 980:
+        tail = tail[:970] + "…\n\n" + SIGNATURE
+    room = 1024 - len(head) - len(tail) - 6
+    title = info["title"]
+    body = title if len(title) <= room else (title[: room - 1] + "…" if room > 20 else "")
+    return "\n\n".join(p for p in (head, body, tail) if p)
+
+
+def details_template(cat):
+    """A fill-in list the bot sends under each poster, for copying into a reply."""
+    if cat == "recruitment":
+        keys = ["Vacancies", "Posts", "Qualification", "Age", "Salary", "Fee", "Apply from", "Last date", "Apply link"]
+    elif cat in ("admit_card", "exam"):
+        keys = ["Posts", "Exam date", "Link"]
+    elif cat in ("result", "answer_key"):
+        keys = ["Posts", "Last date", "Link"]
+    else:
+        keys = ["Posts", "Last date", "Link", "Info"]
+    return "\n".join(k + ": " for k in keys)
 
 
 # Words you can use when replying with details (left side of "Key: value").
@@ -357,6 +432,16 @@ DETAIL_KEYS = {
     "background": "background", "bg": "background",
     "label": "vacancy_label", "vacancy label": "vacancy_label",
     "tagline": "tagline",
+    "qualification": "qualification", "eligibility": "qualification", "education": "qualification", "योग्यता": "qualification",
+    "age": "age", "age limit": "age", "आयु": "age",
+    "salary": "salary", "pay": "salary", "pay scale": "salary", "वेतन": "salary",
+    "fee": "fee", "fees": "fee", "application fee": "fee", "शुल्क": "fee",
+    "selection": "selection", "selection process": "selection",
+    "apply from": "start_date", "start date": "start_date", "starting date": "start_date",
+    "exam date": "exam_date", "परीक्षा तिथि": "exam_date",
+    "apply link": "apply_link", "link": "apply_link", "apply online": "apply_link",
+    "website": "website", "official website": "website",
+    "info": "extra", "extra": "extra", "details": "extra",
 }
 CATEGORY_WORDS = {
     "recruitment": "recruitment", "job": "recruitment", "vacancy": "recruitment", "bharti": "recruitment",
@@ -417,8 +502,8 @@ def pending_row(markup):
 def handle_updates(log_ws):
     """Processes button taps and replies sent since the last run."""
     updates = tg("getUpdates", timeout=0, allowed_updates=["message", "callback_query"])
+    print(f"Button taps / replies waiting: {len(updates)}")
     if not updates:
-        print("No button taps or replies to handle.")
         return
     state = {"caption": {}, "photo": {}, "rows": set()}   # changes made during this run
     for u in updates:
@@ -449,55 +534,92 @@ def load_info(log_ws, row):
 
 
 def on_reply(m, state, log_ws):
+    """A reply to a poster (or to the details list under it) changes that poster."""
     if str(m.get("chat", {}).get("id")) != ADMIN:
         return
     target = m.get("reply_to_message")
     text = (m.get("text") or "").strip()
-    if not target or not text or "photo" not in target:
+    if not target or not text:
         return
-    row = pending_row(target.get("reply_markup"))
-    if not row:
-        return
-    mid = target["message_id"]
-    details = parse_details(text)
-    info = load_info(log_ws, row)
 
+    if "photo" in target:
+        row = pending_row(target.get("reply_markup"))
+        if not row:
+            return
+        info = load_info(log_ws, row)
+        mid, markup = target["message_id"], target["reply_markup"]
+        current_caption = state["caption"].get(mid, target.get("caption", ""))
+    else:
+        found = re.search(r"poster #(\d+)", target.get("text", ""))
+        if not found:
+            return
+        row = int(found.group(1))
+        info = load_info(log_ws, row)
+        if not info or not info.get("msg_id"):
+            return
+        if (log_ws.cell(row, 5).value or "") in ("Posted", "Skipped"):
+            say("That poster was already posted or skipped, so I didn't change it.")
+            return
+        mid = info["msg_id"]
+        markup = keyboard(row, info["url"], log_ws.cell(row, 2).value or "site")
+        current_caption = state["caption"].get(mid, info.get("caption") or make_caption(info))
+
+    details = parse_details(text)
     if details and info:
-        bad_date = details.get("last_date") and not poster.parse_date(details["last_date"])
-        if bad_date:
-            say(f"I couldn't read the date \"{details['last_date']}\". Please write it like 20/10/2026.")
+        bad = [k for k in DATE_FIELDS if details.get(k) and not poster.parse_date(details[k])]
+        if bad:
+            say(f"I couldn't read the date \"{details[bad[0]]}\". Please write dates like 20/10/2026.")
             return
         for k, v in details.items():
             if v in ("", "-", "none", "remove"):
                 info["fields"].pop(k, None)
             else:
                 info["fields"][k] = v
-        caption = state["caption"].get(mid, target.get("caption", ""))
-        if not info.get("custom_caption"):
-            caption = make_caption(info)
+        caption = info.get("caption") if info.get("custom_caption") else make_caption(info)
+        caption = caption or current_caption
         image = poster.make_poster(info["fields"])
         media = {"type": "photo", "media": "attach://photo", "caption": caption}
         res = tg("editMessageMedia", files={"photo": ("poster.jpg", image, "image/jpeg")},
-                 chat_id=ADMIN, message_id=mid, media=media, reply_markup=target["reply_markup"])
+                 chat_id=ADMIN, message_id=mid, media=media, reply_markup=markup)
         state["photo"][mid] = res["photo"][-1]["file_id"]
         state["caption"][mid] = caption
         log_ws.update_cell(row, DETAILS_COL, json.dumps(info, ensure_ascii=False))
-        changed = ", ".join(details.keys()).replace("_", " ")
+        filled = [k for k, v in details.items() if v not in ("", "-", "none", "remove")]
+        changed = ", ".join(filled).replace("_", " ") or "details"
         tg("sendMessage", chat_id=ADMIN, reply_to_message_id=m["message_id"],
-           text=f"🖼️ Poster updated ({changed}). Tap ✅ Post to channel when you're ready.")
+           text=f"🖼️ Poster and caption updated ({changed}). Tap ✅ Post to channel on the poster when you're ready.")
         return
 
     # anything else is treated as a new caption
     if len(text) > 1024:
         say(f"That caption is {len(text)} characters. Telegram allows 1024 under a photo. Please shorten it and reply again.")
         return
-    tg("editMessageCaption", chat_id=ADMIN, message_id=mid, caption=text, reply_markup=target["reply_markup"])
+    tg("editMessageCaption", chat_id=ADMIN, message_id=mid, caption=text, reply_markup=markup)
     state["caption"][mid] = text
     if info:
         info["custom_caption"] = True
+        info["caption"] = text
         log_ws.update_cell(row, DETAILS_COL, json.dumps(info, ensure_ascii=False))
     tg("sendMessage", chat_id=ADMIN, reply_to_message_id=m["message_id"],
-       text="✏️ Caption updated. Tap ✅ Post to channel when you're ready.")
+       text="✏️ Caption updated. Tap ✅ Post to channel on the poster when you're ready.")
+
+
+def find_row(log_ws, row, message_id):
+    """The row a poster belongs to. Rows can move if someone deletes rows in the sheet,
+    so check the saved message id and search for it if the row number is out of date."""
+    def msg_id_at(values):
+        try:
+            return json.loads(values[DETAILS_COL - 1]).get("msg_id") if len(values) >= DETAILS_COL else None
+        except (ValueError, AttributeError):
+            return None
+    values = log_ws.get_all_values()
+    if 1 <= row <= len(values) and msg_id_at(values[row - 1]) in (message_id, None):
+        if msg_id_at(values[row - 1]) == message_id or len(values[row - 1]) < DETAILS_COL:
+            return row, values[row - 1]
+    for i, v in enumerate(values[1:], start=2):
+        if msg_id_at(v) == message_id:
+            return i, v
+    return (row, values[row - 1]) if 1 <= row <= len(values) else (None, None)
 
 
 def on_button(q, state, log_ws):
@@ -509,22 +631,37 @@ def on_button(q, state, log_ws):
         answer(q, "Done")
         return
     action, row = data.split(":", 1)
-    row = int(row)
-    status = log_ws.cell(row, 5).value or ""
-    if row in state["rows"] or status in ("Posted", "Skipped"):
-        answer(q, f"Already {status.lower() or 'handled'}.")
+    mid = msg["message_id"]
+    row, values = find_row(log_ws, int(row), mid)
+    status = (values[4] if values and len(values) > 4 else "") or ""
+    now = datetime.now(IST).strftime("%d %b, %H:%M")
+
+    if row is None or row in state["rows"] or status in ("Posted", "Skipped"):
+        label = f"✅ Already posted" if status == "Posted" else f"❌ Already skipped" if status == "Skipped" else "Already handled"
+        answer(q, label)
+        try:
+            tg("editMessageReplyMarkup", chat_id=ADMIN, message_id=mid,
+               reply_markup=done_keyboard(msg.get("reply_markup"), label))
+        except TelegramError:
+            pass
+        print(f"Tap on message {mid} ignored: {label} (row {row}).")
         return
     state["rows"].add(row)
-    mid = msg["message_id"]
-    now = datetime.now(IST).strftime("%d %b, %H:%M")
+
     if action == "post":
         caption = state["caption"].get(mid, msg.get("caption", ""))
         photo = state["photo"].get(mid, msg["photo"][-1]["file_id"])
-        tg("sendPhoto", chat_id=CHANNEL, photo=photo, caption=caption)
+        try:
+            tg("sendPhoto", chat_id=CHANNEL, photo=photo, caption=caption)
+        except TelegramError as e:
+            say(f"⚠️ I couldn't post that to the channel. Telegram said: {e}\n"
+                f"Check that the bot is still an admin of the channel with permission to post.")
+            raise
         log_ws.update_cell(row, 5, "Posted")
         tg("editMessageReplyMarkup", chat_id=ADMIN, message_id=mid,
            reply_markup=done_keyboard(msg.get("reply_markup"), f"✅ Posted to channel · {now}"))
         answer(q, "Posted to the channel ✅")
+        tg("sendMessage", chat_id=ADMIN, reply_to_message_id=mid, text="✅ Posted to your channel.")
         print(f"Posted row {row} to the channel.")
     elif action == "skip":
         log_ws.update_cell(row, 5, "Skipped")
@@ -570,8 +707,8 @@ def check_sites(sites_ws, log_ws, problems):
         print(f"Checking {name} ...")
 
         try:
-            html, final_url = fetch(url)
-            links = extract_links(html, final_url, get("Must contain"))
+            page, final_url = fetch(url)
+            links = extract_links(page, final_url, get("Must contain"))
         except Exception as e:
             failures = prev_failures + 1
             result = f"Error: {short(e, 80)}"
@@ -587,7 +724,14 @@ def check_sites(sites_ws, log_ws, problems):
         share = get("Share link").lower() not in ("no", "n", "false", "0")
         org = get("Organisation")
 
-        if not links:
+        is_tg_page = "tgme_widget_message" in page
+        if not links and is_tg_page:
+            result = "OK: no job posts in the latest messages"
+            if not seen:
+                new_rows.append([stamp, name, "(started watching)", url, "Marker"])
+                messages.append(f"👀 Now watching {name}. There are no job posts in its latest messages, "
+                                f"so you'll hear from me when the next one appears.")
+        elif not links:
             result = "Opened, but found no notice links"
             if get("Result") != result:
                 messages.append(f"🤔 I opened {name} but couldn't find any notice links on it. "
@@ -609,7 +753,7 @@ def check_sites(sites_ws, log_ws, problems):
         else:
             for k, t, u in fresh:
                 label = categorize(t)[0]
-                info = {"title": t, "url": u, "share": share, "fields": poster_fields(t, name, org, label)}
+                info = {"title": t, "url": u, "share": share, "fields": poster_fields(t, name, org, label, share)}
                 new_rows.append([stamp, name, t, u, "Waiting for you", json.dumps(info, ensure_ascii=False)])
                 to_send.append({"row": next_row + len(new_rows) - 1, "site": name, "info": info})
             result = f"OK: {len(links)} notices, {len(fresh)} new"
@@ -623,9 +767,16 @@ def check_sites(sites_ws, log_ws, problems):
         info = item["info"]
         try:
             image = poster.make_poster(info["fields"])
-            tg("sendPhoto", files={"photo": ("poster.jpg", image, "image/jpeg")}, chat_id=ADMIN,
-               caption=make_caption(info), reply_markup=keyboard(item["row"], info["url"], item["site"]))
+            sent = tg("sendPhoto", files={"photo": ("poster.jpg", image, "image/jpeg")}, chat_id=ADMIN,
+                      caption=make_caption(info), reply_markup=keyboard(item["row"], info["url"], item["site"]))
             print(f"  Sent for approval: {info['title'][:70]}")
+            info["msg_id"] = sent["message_id"]
+            log_ws.update_cell(item["row"], 6, json.dumps(info, ensure_ascii=False))
+            template = details_template(info["fields"].get("category"))
+            tg("sendMessage", chat_id=ADMIN, reply_to_message_id=sent["message_id"], parse_mode="HTML",
+               text="✍️ <b>Add job details:</b> tap the list below to copy it, then <b>reply to this message</b> "
+                    "with it filled in. Leave out anything you don't know.\n\n<pre>" + html.escape(template) + "</pre>"
+                    f"\n<i>poster #{item['row']}</i>")
         except Exception as e:
             problems.append(f"Could not send '{info['title'][:60]}': {short(e)}")
             log_ws.update_cell(item["row"], 5, f"Could not send: {short(e, 60)}")
@@ -661,6 +812,9 @@ def main():
         if "webhook" in str(e).lower() or "conflict" in str(e).lower():
             print("Another program is receiving this bot's updates (a webhook or another getUpdates). "
                   "Buttons can't work until that stops.", file=sys.stderr)
+            if datetime.now(IST).minute < 10:      # remind at most about once an hour
+                say("⚠️ I can't see your button taps: another service is connected to this bot "
+                    f"(Telegram says: {e}). Send this message to Claude to fix it.")
 
     problems = []
     check_sites(sites_ws, log_ws, problems)
