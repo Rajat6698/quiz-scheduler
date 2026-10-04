@@ -382,28 +382,107 @@ CAPTION_DETAILS = [
 DATE_FIELDS = ("start_date", "last_date", "exam_date")
 
 
+CAPTION_STYLE = {
+    # heading, Hindi heading, hashtag, closing tips
+    "recruitment": ("📢", "NEW RECRUITMENT", "नई भर्ती", "#Recruitment #SarkariNaukri",
+                    ["✅ Apply before the last date and keep a printout of your form.",
+                     "📖 Read the official notification carefully before applying."]),
+    "admit_card": ("🎫", "ADMIT CARD OUT", "प्रवेश पत्र जारी", "#AdmitCard",
+                   ["🪪 Carry your admit card with a valid photo ID.",
+                    "⏰ Reach the exam centre well before the reporting time."]),
+    "result": ("🏆", "RESULT DECLARED", "परिणाम घोषित", "#Result",
+               ["🔍 Keep your roll number ready to check the result.",
+                "🎉 Congratulations to all selected candidates!"]),
+    "answer_key": ("🔑", "ANSWER KEY OUT", "उत्तर कुंजी जारी", "#AnswerKey",
+                   ["📝 Match your answers and calculate your score.",
+                    "⚖️ Raise objections, if any, before the last date."]),
+    "exam": ("🗓️", "EXAM UPDATE", "परीक्षा अपडेट", "#ExamUpdate",
+             ["📚 Plan your revision according to the new schedule."]),
+    "syllabus": ("📚", "SYLLABUS OUT", "पाठ्यक्रम जारी", "#Syllabus",
+                 ["🎯 Start your preparation topic by topic."]),
+    "general": ("📌", "IMPORTANT UPDATE", "महत्वपूर्ण सूचना", "#Update",
+                ["📖 Read the official notice carefully."]),
+}
+DIVIDER = "━━━━━━━━━━━━━━━"
+
+
+def e(text):
+    return html.escape(str(text), quote=False)
+
+
+def days_left_text(value):
+    dt = poster.parse_date(value)
+    if not dt:
+        return ""
+    days = (dt - datetime.now(IST).date()).days
+    if days < 0:
+        return " (closed)"
+    if days == 0:
+        return " ⚠️ <b>Last day today!</b>"
+    if days <= 7:
+        return f" ⏳ <b>Only {days} day{'s' if days > 1 else ''} left!</b>"
+    return ""
+
+
 def make_caption(info):
-    """info = the Details saved for this notice (poster fields + title, url, share)."""
+    """The post text shown under the poster, as Telegram HTML. Built fresh each time,
+    so the "days left" is right on the day it is posted."""
     f = info["fields"]
     cat = f.get("category", "general")
-    head = f"{CATEGORY_EMOJI.get(cat, '📌')} {CATEGORY_TO_LABEL.get(cat, 'NOTIFICATION')}"
-    facts = []
-    for key, label in CAPTION_DETAILS:
-        val = str(f.get(key, "")).strip()
-        if not val:
-            continue
-        if key in DATE_FIELDS:
-            val = fmt_date(val)
-        facts.append(f"{label} {val}" if key == "extra" else f"{label}: {val}")
-    if info.get("share") and info.get("url") and not f.get("apply_link"):
-        facts.append(f"🔗 Notice: {info['url']}")
-    tail = "\n".join(facts + ["", SIGNATURE]) if facts else SIGNATURE
-    if len(tail) > 980:
-        tail = tail[:970] + "…\n\n" + SIGNATURE
-    room = 1024 - len(head) - len(tail) - 6
-    title = info["title"]
-    body = title if len(title) <= room else (title[: room - 1] + "…" if room > 20 else "")
-    return "\n\n".join(p for p in (head, body, tail) if p)
+    emoji, label, hindi, tag, tips = CAPTION_STYLE.get(cat, CAPTION_STYLE["general"])
+
+    def val(key):
+        v = str(f.get(key, "")).strip()
+        return fmt_date(v) if v and key in DATE_FIELDS else v
+
+    job = [(k, lbl) for k, lbl in (("org_full", "🏛️ Organisation"), ("posts", "💼 Post"), ("vacancies", "👥 Vacancies"),
+                                    ("qualification", "🎓 Qualification"), ("age", "🎂 Age Limit"), ("salary", "💵 Salary"),
+                                    ("fee", "💰 Application Fee"), ("selection", "📝 Selection")) if val(k)]
+    dates = [(k, lbl) for k, lbl in (("start_date", "🟢 Apply From"), ("last_date", "🔴 Last Date"),
+                                      ("exam_date", "🗓️ Exam Date")) if val(k)]
+
+    head = f"{emoji} <b>{label} | {hindi}</b>"
+    title = f"<b>{e(info['title'])}</b>"
+    parts = []
+    if job:
+        parts.append(DIVIDER + "\n📌 <b>Details</b>\n" +
+                     "\n".join(f"{lbl}: <b>{e(val(k))}</b>" for k, lbl in job))
+    if dates:
+        parts.append(DIVIDER + "\n🗓️ <b>Important Dates</b>\n" +
+                     "\n".join(f"{lbl}: <b>{e(val(k))}</b>" + (days_left_text(f[k]) if k == "last_date" else "")
+                               for k, lbl in dates))
+    links = []
+    if f.get("apply_link"):
+        links.append(f"🔗 <b>{'Apply Online' if cat == 'recruitment' else 'Official Link'}:</b> {e(f['apply_link'])}")
+    elif info.get("share") and info.get("url"):
+        links.append(f"🔗 <b>Official Notice:</b> {e(info['url'])}")
+    if f.get("website"):
+        links.append(f"🌐 <b>Website:</b> {e(f['website'])}")
+    if f.get("extra"):
+        links.append(f"ℹ️ {e(f['extra'])}")
+    if links:
+        parts.append(DIVIDER + "\n" + "\n".join(links))
+    def build(title_text, tip_lines):
+        end = ("\n".join(tip_lines) + "\n\n" if tip_lines else "") + \
+              f"📲 Join for daily jobs, quizzes & PDFs: @hpgk_statsguru\n{tag} #HimachalJobs #StatsGuru\n\n{e(SIGNATURE)}"
+        return "\n\n".join(p for p in [head, title_text] + parts + [DIVIDER + "\n" + end] if p)
+
+    # Telegram allows 1024 characters under a photo: drop tips, then shorten the title if needed.
+    text = build(title, tips)
+    if visible_len(text) > 1024:
+        text = build(title, [])
+    if visible_len(text) > 1024:
+        over = visible_len(text) - 1024 + 2
+        text = build(f"<b>{e(info['title'][: max(20, len(info['title']) - over)])}…</b>", [])
+    return text
+
+
+def visible_len(html_text):
+    return len(html.unescape(re.sub(r"<[^>]+>", "", html_text)))
+
+
+def custom_caption_html(text):
+    return e(text)
 
 
 def details_template(cat):
@@ -575,10 +654,10 @@ def on_reply(m, state, log_ws):
                 info["fields"].pop(k, None)
             else:
                 info["fields"][k] = v
-        caption = info.get("caption") if info.get("custom_caption") else make_caption(info)
-        caption = caption or current_caption
+        caption = custom_caption_html(info["caption"]) if info.get("custom_caption") and info.get("caption") \
+            else make_caption(info)
         image = poster.make_poster(info["fields"])
-        media = {"type": "photo", "media": "attach://photo", "caption": caption}
+        media = {"type": "photo", "media": "attach://photo", "caption": caption, "parse_mode": "HTML"}
         res = tg("editMessageMedia", files={"photo": ("poster.jpg", image, "image/jpeg")},
                  chat_id=ADMIN, message_id=mid, media=media, reply_markup=markup)
         state["photo"][mid] = res["photo"][-1]["file_id"]
@@ -594,8 +673,9 @@ def on_reply(m, state, log_ws):
     if len(text) > 1024:
         say(f"That caption is {len(text)} characters. Telegram allows 1024 under a photo. Please shorten it and reply again.")
         return
-    tg("editMessageCaption", chat_id=ADMIN, message_id=mid, caption=text, reply_markup=markup)
-    state["caption"][mid] = text
+    tg("editMessageCaption", chat_id=ADMIN, message_id=mid, caption=custom_caption_html(text),
+       parse_mode="HTML", reply_markup=markup)
+    state["caption"][mid] = custom_caption_html(text)
     if info:
         info["custom_caption"] = True
         info["caption"] = text
@@ -649,10 +729,19 @@ def on_button(q, state, log_ws):
     state["rows"].add(row)
 
     if action == "post":
-        caption = state["caption"].get(mid, msg.get("caption", ""))
+        info = None
+        try:
+            info = json.loads(values[DETAILS_COL - 1]) if len(values) >= DETAILS_COL else None
+        except ValueError:
+            pass
+        if info and info.get("fields") is not None:
+            caption = custom_caption_html(info["caption"]) if info.get("custom_caption") and info.get("caption") \
+                else make_caption(info)
+        else:
+            caption = e(state["caption"].get(mid, msg.get("caption", "")))
         photo = state["photo"].get(mid, msg["photo"][-1]["file_id"])
         try:
-            tg("sendPhoto", chat_id=CHANNEL, photo=photo, caption=caption)
+            tg("sendPhoto", chat_id=CHANNEL, photo=photo, caption=caption, parse_mode="HTML")
         except TelegramError as e:
             say(f"⚠️ I couldn't post that to the channel. Telegram said: {e}\n"
                 f"Check that the bot is still an admin of the channel with permission to post.")
@@ -768,7 +857,8 @@ def check_sites(sites_ws, log_ws, problems):
         try:
             image = poster.make_poster(info["fields"])
             sent = tg("sendPhoto", files={"photo": ("poster.jpg", image, "image/jpeg")}, chat_id=ADMIN,
-                      caption=make_caption(info), reply_markup=keyboard(item["row"], info["url"], item["site"]))
+                      caption=make_caption(info), parse_mode="HTML",
+                      reply_markup=keyboard(item["row"], info["url"], item["site"]))
             print(f"  Sent for approval: {info['title'][:70]}")
             info["msg_id"] = sent["message_id"]
             log_ws.update_cell(item["row"], 6, json.dumps(info, ensure_ascii=False))
